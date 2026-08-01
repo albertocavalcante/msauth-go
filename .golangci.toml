@@ -1,0 +1,67 @@
+# golangci-lint v2 configuration
+version = "2"
+
+[run]
+timeout = "5m"
+tests = true
+modules-download-mode = "readonly"
+
+[linters]
+default = "standard"
+enable = [
+  "bodyclose",
+  "copyloopvar",
+  "errcheck",
+  "gocritic",
+  "govet",
+  "ineffassign",
+  "intrange",
+  "misspell",
+  "noctx",
+  "prealloc",
+  "staticcheck",
+  "unconvert",
+  "unparam",
+  "unused",
+  "whitespace",
+]
+disable = [
+  "exhaustruct",
+  "varnamelen",
+  "wrapcheck",
+]
+
+[linters.settings.errcheck]
+check-type-assertions = false
+check-blank = false
+exclude-functions = [
+  "(io.Closer).Close",
+  "(*os.File).Close",
+  "os.RemoveAll",
+  "encoding/json.Marshal",
+]
+
+[linters.settings.gocritic]
+disabled-checks = [
+  "ifElseChain",
+  "singleCaseSwitch",
+  # The public API uses value semantics on purpose: Config is passed by value
+  # (no mutation surprises) and MSAL's Account is returned/ranged by value.
+  # These perf heuristics fight that idiom for negligible copies.
+  "hugeParam",
+  "rangeValCopy",
+]
+enabled-tags = ["diagnostic", "performance", "style"]
+
+[linters.settings.misspell]
+locale = "US"
+
+[linters.settings.staticcheck]
+checks = ["all", "-ST1000"]
+
+[linters.exclusions]
+generated = "lax"
+
+[[linters.exclusions.rules]]
+path = "_test\\.go"
+linters = ["errcheck", "unparam", "gocritic"]
