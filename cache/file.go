@@ -35,13 +35,13 @@ func NewFileStore(dir string) Store {
 const keyFileName = "cache.key"
 
 func (f *fileStore) keyBytes() ([]byte, error) {
+	if err := ensurePrivateDir(f.dir); err != nil {
+		return nil, err
+	}
 	p := filepath.Join(f.dir, keyFileName)
 	if b, err := readKey(p); err == nil {
 		return b, nil // fast path: key already exists
 	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	if err := os.MkdirAll(f.dir, 0o700); err != nil {
 		return nil, err
 	}
 	nk := make([]byte, 32)
@@ -75,6 +75,9 @@ func readKey(p string) ([]byte, error) {
 	}
 	if len(b) != 32 {
 		return nil, fmt.Errorf("cache key %s is corrupt (want 32 bytes, got %d)", p, len(b))
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		return nil, err
 	}
 	return b, nil
 }
@@ -129,7 +132,7 @@ func (f *fileStore) Save(_ context.Context, key string, blob []byte) error {
 		return err
 	}
 	ct := gcm.Seal(nonce, nonce, blob, nil)
-	if err := os.MkdirAll(f.dir, 0o700); err != nil {
+	if err := ensurePrivateDir(f.dir); err != nil {
 		return err
 	}
 	// Atomic write via a UNIQUE temp file then rename. A unique name (not a
@@ -153,6 +156,13 @@ func (f *fileStore) Save(_ context.Context, key string, blob []byte) error {
 		return err
 	}
 	return nil
+}
+
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
 }
 
 func writeSyncClose(f *os.File, data []byte) error {

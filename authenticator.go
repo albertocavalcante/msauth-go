@@ -177,19 +177,30 @@ func (a *Authenticator) Identity(ctx context.Context) (*Identity, error) {
 	return &Identity{Username: acct.PreferredUsername, HomeAccountID: acct.HomeAccountID}, nil
 }
 
-// Logout removes cached accounts and deletes the persisted cache blob. The blob
-// is keyed per client id and holds every account signed in under it, so Logout
-// signs out ALL accounts for this Authenticator's client id, not just the
-// preferred one.
+// Logout removes cached accounts. When [Config.Account] is set, only the
+// matching username or home_account_id is removed; otherwise all accounts under
+// this Authenticator's client id are removed.
 func (a *Authenticator) Logout(ctx context.Context) error {
-	if accts, err := a.client.Accounts(ctx); err == nil {
-		// Best-effort in-memory cleanup; the durable source of truth is the
-		// persisted blob deleted below, and a fresh process starts clean.
-		for i := range accts {
-			_ = a.client.RemoveAccount(ctx, accts[i])
+	accts, err := a.client.Accounts(ctx)
+	if err != nil {
+		if a.cfg.Account == "" {
+			return a.store.Delete(ctx, a.key)
+		}
+		return fmt.Errorf("msauth: list accounts for logout: %w", err)
+	}
+	targets, err := logoutTargets(accts, a.cfg.Account)
+	if err != nil {
+		return err
+	}
+	for i := range targets {
+		if err := a.client.RemoveAccount(ctx, targets[i]); err != nil {
+			return fmt.Errorf("msauth: remove cached account %q: %w", targets[i].PreferredUsername, err)
 		}
 	}
-	return a.store.Delete(ctx, a.key)
+	if len(targets) == len(accts) {
+		return a.store.Delete(ctx, a.key)
+	}
+	return nil
 }
 
 // account selects the preferred cached account, or the first one.
@@ -203,7 +214,7 @@ func (a *Authenticator) account(ctx context.Context) (public.Account, error) {
 	}
 	if a.cfg.Account != "" {
 		for i := range accts {
-			if strings.EqualFold(accts[i].PreferredUsername, a.cfg.Account) {
+			if accountMatches(accts[i], a.cfg.Account) {
 				return accts[i], nil
 			}
 		}
@@ -212,4 +223,33 @@ func (a *Authenticator) account(ctx context.Context) (public.Account, error) {
 		return public.Account{}, fmt.Errorf("%w: no cached account matches %q", ErrLoginRequired, a.cfg.Account)
 	}
 	return accts[0], nil
+}
+
+func logoutTargets(accts []public.Account, account string) ([]public.Account, error) {
+	if account == "" {
+		return accts, nil
+	}
+	for i := range accts {
+		if accountMatches(accts[i], account) {
+			return []public.Account{accts[i]}, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: no cached account matches %q", ErrLoginRequired, account)
+}
+
+func accountMatches(acct public.Account, value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, candidate := range []string{
+		acct.PreferredUsername,
+		acct.HomeAccountID,
+		acct.LocalAccountID,
+	} {
+		if strings.EqualFold(candidate, value) {
+			return true
+		}
+	}
+	return false
 }

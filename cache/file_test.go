@@ -46,6 +46,44 @@ func TestFileStore_RoundTripAndPersistence(t *testing.T) {
 	}
 }
 
+func TestFileStore_TightensExistingDirectoryPermissions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+
+	st := NewFileStore(dir)
+	if err := st.Save(context.Background(), "acct", []byte("secret")); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("dir mode = %o, want 700", got)
+	}
+	keyInfo, err := os.Stat(filepath.Join(dir, keyFileName))
+	if err != nil {
+		t.Fatalf("stat key: %v", err)
+	}
+	if got := keyInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("key mode = %o, want 600", got)
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.enc"))
+	if len(files) != 1 {
+		t.Fatalf("want 1 .enc file, got %d", len(files))
+	}
+	blobInfo, err := os.Stat(files[0])
+	if err != nil {
+		t.Fatalf("stat blob: %v", err)
+	}
+	if got := blobInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("blob mode = %o, want 600", got)
+	}
+}
+
 func TestFileStore_AbsentAndDelete(t *testing.T) {
 	ctx := context.Background()
 	st := NewFileStore(t.TempDir())

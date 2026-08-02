@@ -44,15 +44,15 @@ func main() {
 
 ### Token store
 - `cache.NewKeychainStore()` — macOS Keychain / Linux Secret Service (default choice).
-- `cache.NewFileStore(dir)` — AES-256-GCM encrypted file (headless / no keyring). Weaker than Keychain (key sits beside data); `0600` files.
+- `cache.NewFileStore(dir)` — AES-256-GCM encrypted file (headless / no keyring). Weaker than Keychain (key sits beside data); `0700` directory and `0600` files.
 
 ### Options
-- `Config`: `ClientID`, `Authority` (default `/consumers`), `Scopes`, `Account` (pick among multiple cached), `LoginTimeout`.
+- `Config`: `ClientID`, `Authority` (default `/consumers`), `Scopes`, `Account` (pick among multiple cached by username, `home_account_id`, or local account ID), `LoginTimeout`.
 - `Login`: `WithDevice()`, `WithLoginScopes(...)`, `WithPrompt(fn)`, `WithBrowserOpener(fn)`.
 - `Token`: `WithScopes(...)`.
 
 ## API
-`New`, `(*Authenticator).Login / Token / Identity / Logout`. `ErrLoginRequired` is joined into errors when no usable cached account exists. Test doubles in `msauthtest` (`MemStore`).
+`New`, `(*Authenticator).Login / Token / Identity / Logout`. `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. `ErrLoginRequired` is joined into errors when no usable cached account exists. Test doubles in `msauthtest` (`MemStore`).
 
 ## Develop
 ```sh

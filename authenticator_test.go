@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"testing"
+
+	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/public"
 
 	"github.com/albertocavalcante/msauth-go/msauthtest"
 )
@@ -95,6 +98,42 @@ func TestLogout_EmptyIsNoError(t *testing.T) {
 	}
 	if err := a.Logout(context.Background()); err != nil {
 		t.Fatalf("Logout: %v", err)
+	}
+}
+
+func TestLogoutTargetsAllAccountsWhenNoAccountConfigured(t *testing.T) {
+	accounts := []public.Account{
+		{PreferredUsername: "one@example.com", HomeAccountID: "home-1"},
+		{PreferredUsername: "two@example.com", HomeAccountID: "home-2"},
+	}
+	got, err := logoutTargets(accounts, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, accounts) {
+		t.Fatalf("got %+v, want %+v", got, accounts)
+	}
+}
+
+func TestLogoutTargetsOnlyConfiguredAccount(t *testing.T) {
+	accounts := []public.Account{
+		{PreferredUsername: "one@example.com", HomeAccountID: "home-1"},
+		{PreferredUsername: "two@example.com", HomeAccountID: "home-2"},
+	}
+	got, err := logoutTargets(accounts, "HOME-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []public.Account{accounts[1]}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestLogoutTargetsMissingConfiguredAccount(t *testing.T) {
+	_, err := logoutTargets([]public.Account{{PreferredUsername: "one@example.com", HomeAccountID: "home-1"}}, "missing@example.com")
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired", err)
 	}
 }
 
