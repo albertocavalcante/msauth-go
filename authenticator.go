@@ -128,6 +128,17 @@ func WithScopes(scopes ...string) TokenOption {
 // refreshing silently as needed. It returns [ErrLoginRequired] (joined with the
 // underlying cause) when there is no usable cached account.
 func (a *Authenticator) Token(ctx context.Context, opts ...TokenOption) (string, error) {
+	token, err := a.TokenInfo(ctx, opts...)
+	if err != nil {
+		return "", err
+	}
+	return token.Value, nil
+}
+
+// TokenInfo is [Authenticator.Token] with the token's expiry and granted
+// scopes attached. Use it when the caller has to schedule around expiry or
+// verify that consent actually granted a scope it asked for.
+func (a *Authenticator) TokenInfo(ctx context.Context, opts ...TokenOption) (AccessToken, error) {
 	tc := tokenConfig{scopes: a.cfg.Scopes}
 	for _, o := range opts {
 		o(&tc)
@@ -135,11 +146,11 @@ func (a *Authenticator) Token(ctx context.Context, opts ...TokenOption) (string,
 	if len(tc.scopes) == 0 {
 		// Empty scopes cause a silent cache miss in MSAL's silent path, which
 		// would otherwise be misreported as ErrLoginRequired.
-		return "", ErrNoScopes
+		return AccessToken{}, ErrNoScopes
 	}
 	acct, err := a.account(ctx)
 	if err != nil {
-		return "", err
+		return AccessToken{}, err
 	}
 	res, err := a.client.AcquireTokenSilent(ctx, tc.scopes, public.WithSilentAccount(acct))
 	if err != nil {
@@ -147,13 +158,17 @@ func (a *Authenticator) Token(ctx context.Context, opts ...TokenOption) (string,
 			// Network/timeout/cancellation: a retry may succeed. Do NOT signal
 			// ErrLoginRequired, or callers would force a needless (and offline-
 			// doomed) re-login on a transient blip.
-			return "", fmt.Errorf("msauth: silent token refresh failed: %w", err)
+			return AccessToken{}, fmt.Errorf("msauth: silent token refresh failed: %w", err)
 		}
 		// Otherwise the cached grant is unusable (expired/revoked/consent) →
 		// re-login is genuinely required; keep the cause inspectable.
-		return "", errors.Join(ErrLoginRequired, err)
+		return AccessToken{}, errors.Join(ErrLoginRequired, err)
 	}
-	return res.AccessToken, nil
+	return AccessToken{
+		Value:         res.AccessToken,
+		ExpiresOn:     res.ExpiresOn.UTC(),
+		GrantedScopes: res.GrantedScopes,
+	}, nil
 }
 
 // isTransient reports whether err is a transient network/context failure rather

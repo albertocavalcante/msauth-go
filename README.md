@@ -42,6 +42,28 @@ func main() {
 }
 ```
 
+### Handing tokens to a REST client
+
+`Authenticator.Token` is variadic, so it does not satisfy the
+`Token(ctx) (string, error)` interface that Microsoft REST clients expect.
+`TokenSource` is the scope-bound adapter that does, without either module
+importing the other:
+
+```go
+graph, err := msgraph.New(auth.TokenSource("Mail.Read"))
+```
+
+It holds no token state: every call goes through the cached silent-refresh
+path, so calling it per request is the intended usage. Use
+`TokenInfo` instead of `Token` when the caller needs the expiry or the scopes
+consent actually granted:
+
+```go
+token, err := auth.TokenInfo(ctx)
+if token.Expired(time.Now(), time.Minute) { /* ... */ }
+if !token.HasScope("Mail.Send") { /* consent was declined */ }
+```
+
 ### Token store
 - `cache.NewKeychainStore()` — macOS Keychain / Linux Secret Service (default choice).
 - `cache.NewFileStore(dir)` — AES-256-GCM encrypted file (headless / no keyring). Weaker than Keychain (key sits beside data); `0700` directory and `0600` files.
@@ -49,10 +71,10 @@ func main() {
 ### Options
 - `Config`: `ClientID`, `Authority` (default `/consumers`), `Scopes`, `Account` (pick among multiple cached by username, `home_account_id`, or local account ID), `LoginTimeout`.
 - `Login`: `WithDevice()`, `WithLoginScopes(...)`, `WithPrompt(fn)`, `WithBrowserOpener(fn)`.
-- `Token`: `WithScopes(...)`.
+- `Token` / `TokenInfo`: `WithScopes(...)`.
 
 ## API
-`New`, `(*Authenticator).Login / Token / Identity / Logout`. `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. `ErrLoginRequired` is joined into errors when no usable cached account exists. Test doubles in `msauthtest` (`MemStore`).
+`New`, `(*Authenticator).Login / Token / TokenInfo / TokenSource / Identity / Logout`. `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. `ErrLoginRequired` is joined into errors when no usable cached account exists. `ErrNoScopes` guards the empty-scope footgun on both `Login` and `Token`. `AccessToken` carries `Value`, `ExpiresOn`, `GrantedScopes`, plus `Expired(now, skew)` and `HasScope`. Test doubles in `msauthtest` (`MemStore`).
 
 ## Develop
 ```sh
