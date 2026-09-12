@@ -121,3 +121,71 @@ func TestAccessTokenHasScope(t *testing.T) {
 		t.Fatal("HasScope matched a prefix")
 	}
 }
+
+// The silent path re-reads and decrypts the token cache on every call, so a
+// source that did not cache made a command's cost scale with its request
+// count rather than its work.
+func TestTokenSourceReusesAValidToken(t *testing.T) {
+	t.Parallel()
+	source := &TokenSource{}
+	source.cached = AccessToken{
+		Value:     "cached",
+		ExpiresOn: time.Now().Add(time.Hour),
+	}
+
+	// No authenticator is set, so any call that does not use the cache will
+	// panic rather than quietly fetch.
+	for range 100 {
+		token, err := source.TokenInfo(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token.Value != "cached" {
+			t.Fatalf("token = %q, want the cached one", token.Value)
+		}
+	}
+}
+
+// A token within the refresh margin must not be reused: a request can be in
+// flight longer than the time left on it.
+func TestTokenSourceRefreshesNearExpiry(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		expiresIn time.Duration
+		wantReuse bool
+	}{
+		{"plenty of time", time.Hour, true},
+		{"just outside the margin", tokenRefreshSkew + time.Minute, true},
+		{"inside the margin", tokenRefreshSkew / 2, false},
+		{"already expired", -time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := AccessToken{Value: "v", ExpiresOn: time.Now().Add(tc.expiresIn)}
+			reusable := !token.Expired(time.Now(), tokenRefreshSkew)
+			if reusable != tc.wantReuse {
+				t.Errorf("reusable = %v, want %v", reusable, tc.wantReuse)
+			}
+		})
+	}
+}
+
+func TestTokenSourceInvalidateForcesARefetch(t *testing.T) {
+	t.Parallel()
+	source := &TokenSource{}
+	source.cached = AccessToken{Value: "cached", ExpiresOn: time.Now().Add(time.Hour)}
+
+	if _, err := source.TokenInfo(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source.Invalidate()
+
+	// With the cache cleared and no authenticator, the next call must try to
+	// fetch rather than return the discarded token.
+	defer func() {
+		if recover() == nil {
+			t.Error("Invalidate did not clear the cached token")
+		}
+	}()
+	_, _ = source.TokenInfo(context.Background())
+}

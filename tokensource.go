@@ -3,6 +3,7 @@ package msauth
 import (
 	"context"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -48,13 +49,31 @@ func (t AccessToken) HasScope(scope string) bool {
 // be handed to them directly. [Authenticator.Token] cannot be used for that
 // because its variadic options change its signature.
 //
-// A TokenSource holds no token state of its own: every call goes through the
-// authenticator's silent-refresh path, which is cached, so calling it per
-// request is the intended usage.
+// A TokenSource caches the token it last obtained and reuses it until it is
+// close to expiring, so calling it per request is the intended usage.
+//
+// The caching is not an optimization of something already cheap. The silent
+// path underneath re-reads and decrypts the token cache on every call, which
+// on a keychain-backed store costs hundreds of milliseconds of CPU; a command
+// making twenty requests spent almost all of its time there rather than
+// talking to the service.
+//
+// A TokenSource is safe for concurrent use. A refresh is taken under the lock
+// so that concurrent callers wait for one refresh instead of each starting
+// their own, which is the behavior that made the cost visible in the first
+// place.
 type TokenSource struct {
 	auth   *Authenticator
 	scopes []string
+
+	mu     sync.Mutex
+	cached AccessToken
 }
+
+// tokenRefreshSkew is how long before expiry a cached token stops being
+// reused. It has to exceed the time a request can spend in flight, or a token
+// that looked valid when it was chosen can expire before it arrives.
+const tokenRefreshSkew = 2 * time.Minute
 
 // TokenSource returns a token provider bound to scopes. With no scopes it uses
 // [Config.Scopes].
@@ -64,18 +83,49 @@ func (a *Authenticator) TokenSource(scopes ...string) *TokenSource {
 
 // Token returns a valid access token, refreshing silently as needed.
 func (s *TokenSource) Token(ctx context.Context) (string, error) {
-	if len(s.scopes) == 0 {
-		return s.auth.Token(ctx)
+	token, err := s.TokenInfo(ctx)
+	if err != nil {
+		return "", err
 	}
-	return s.auth.Token(ctx, WithScopes(s.scopes...))
+	return token.Value, nil
 }
 
-// TokenInfo returns the access token with its expiry and granted scopes.
+// TokenInfo returns the access token with its expiry and granted scopes,
+// reusing the last one until it is close to expiring.
 func (s *TokenSource) TokenInfo(ctx context.Context) (AccessToken, error) {
-	if len(s.scopes) == 0 {
-		return s.auth.TokenInfo(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cached.Value != "" && !s.cached.Expired(time.Now(), tokenRefreshSkew) {
+		return s.cached, nil
 	}
-	return s.auth.TokenInfo(ctx, WithScopes(s.scopes...))
+
+	var (
+		token AccessToken
+		err   error
+	)
+	if len(s.scopes) == 0 {
+		token, err = s.auth.TokenInfo(ctx)
+	} else {
+		token, err = s.auth.TokenInfo(ctx, WithScopes(s.scopes...))
+	}
+	if err != nil {
+		return AccessToken{}, err
+	}
+	s.cached = token
+	return token, nil
+}
+
+// Invalidate discards the cached token so the next call fetches a fresh one.
+//
+// Expiry is handled without this. It exists for the case expiry cannot
+// predict: a token revoked or a consent withdrawn while it is still within
+// its stated lifetime, which the service reports as a 401 rather than in
+// advance.
+func (s *TokenSource) Invalidate() {
+	s.mu.Lock()
+	s.cached = AccessToken{}
+	s.mu.Unlock()
 }
 
 // Scopes returns the scopes this source requests.
