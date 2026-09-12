@@ -189,3 +189,54 @@ func TestTokenSourceInvalidateForcesARefetch(t *testing.T) {
 	}()
 	_, _ = source.TokenInfo(context.Background())
 }
+
+// equalFoldASCII decides whether a granted scope matches a wanted one, so a
+// character it folds wrongly is a permission silently mismatched. The letters
+// at the ends of the alphabet are where a comparison written with the wrong
+// inequality stops folding.
+func TestASCIIFoldingCoversTheAlphabetEnds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		// 'A' and 'Z' are the boundary characters: an off-by-one in either
+		// comparison leaves exactly one of them unfolded.
+		{"A", "a", true},
+		{"a", "A", true},
+		{"Z", "z", true},
+		{"z", "Z", true},
+		{"AZ", "az", true},
+		{"az", "AZ", true},
+		{"Mail.Read", "mail.read", true},
+		{"MAIL.READ", "Mail.Read", true},
+		// Characters just outside the range must not be folded into letters.
+		{"@", "`", false},
+		{"[", "{", false},
+		{"A", "b", false},
+		{"", "", true},
+		{"a", "", false},
+		{"abc", "ab", false},
+	} {
+		t.Run(tc.a+"_vs_"+tc.b, func(t *testing.T) {
+			if got := equalFoldASCII(tc.a, tc.b); got != tc.want {
+				t.Errorf("equalFoldASCII(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// The same boundaries reached through the scope check that uses it, since
+// that is what actually decides consent.
+func TestHasScopeFoldsTheAlphabetEnds(t *testing.T) {
+	t.Parallel()
+	token := AccessToken{GrantedScopes: []string{"AZmail.READz"}}
+	for _, want := range []string{"AZmail.READz", "azmail.readz", "AZMAIL.READZ"} {
+		if !token.HasScope(want) {
+			t.Errorf("HasScope(%q) = false, want true", want)
+		}
+	}
+	if token.HasScope("azmail.readY") {
+		t.Error("matched a scope that differs in a letter")
+	}
+}

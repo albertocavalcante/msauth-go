@@ -58,3 +58,14 @@ ci: fmt-check vet test-race lint
 # Clean build artifacts
 clean:
     rm -rf bin/ coverage.out coverage.html
+
+# Measure how much of the suite is load-bearing, by changing the code and
+# seeing whether a test notices. A surviving mutant names something no test
+# checks. This is deliberately not part of `ci`: it takes minutes, not seconds.
+mutate *ARGS:
+    go tool -modfile=tools.go.mod mutante run {{ARGS}}
+
+# Boundary comparisons only, which is the fastest useful slice and where
+# off-by-one bugs hide.
+mutate-bounds:
+    go tool -modfile=tools.go.mod mutante run --operators cond_boundary

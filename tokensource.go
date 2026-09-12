@@ -68,6 +68,10 @@ type TokenSource struct {
 
 	mu     sync.Mutex
 	cached AccessToken
+	// fetch obtains a fresh token. It is a field so a test can count how
+	// often a refresh actually happens, which is the only way to show that
+	// concurrent callers share one instead of each starting their own.
+	fetch func(context.Context) (AccessToken, error)
 }
 
 // tokenRefreshSkew is how long before expiry a cached token stops being
@@ -100,20 +104,23 @@ func (s *TokenSource) TokenInfo(ctx context.Context) (AccessToken, error) {
 		return s.cached, nil
 	}
 
-	var (
-		token AccessToken
-		err   error
-	)
-	if len(s.scopes) == 0 {
-		token, err = s.auth.TokenInfo(ctx)
-	} else {
-		token, err = s.auth.TokenInfo(ctx, WithScopes(s.scopes...))
-	}
+	token, err := s.refresh(ctx)
 	if err != nil {
 		return AccessToken{}, err
 	}
 	s.cached = token
 	return token, nil
+}
+
+// refresh obtains a token from the authenticator, or from the test seam.
+func (s *TokenSource) refresh(ctx context.Context) (AccessToken, error) {
+	if s.fetch != nil {
+		return s.fetch(ctx)
+	}
+	if len(s.scopes) == 0 {
+		return s.auth.TokenInfo(ctx)
+	}
+	return s.auth.TokenInfo(ctx, WithScopes(s.scopes...))
 }
 
 // Invalidate discards the cached token so the next call fetches a fresh one.
