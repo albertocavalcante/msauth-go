@@ -2,9 +2,13 @@ package cache
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/zalando/go-keyring"
 )
@@ -43,70 +47,214 @@ func chunkName(key string, i int) string {
 	return key + "#" + strconv.Itoa(i)
 }
 
-// Load reassembles the blob from its chunks. The count marker (stored under
-// key) is written last on Save, so its presence implies a complete write.
-func (k *keychainStore) Load(_ context.Context, key string) ([]byte, error) {
-	countStr, err := keyring.Get(k.service, key)
+// A v2 marker names immutable chunks. The legacy marker is only a count.
+type chunkMarker struct {
+	generation string
+	count      int
+	digest     string
+}
+
+func (m chunkMarker) encode() string {
+	if m.generation == "" {
+		return strconv.Itoa(m.count)
+	}
+	return "v2:" + m.generation + ":" + strconv.Itoa(m.count) + ":" + m.digest
+}
+
+func parseMarker(raw string) (chunkMarker, error) {
+	if !strings.HasPrefix(raw, "v2:") {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return chunkMarker{}, fmt.Errorf("keychain: invalid legacy chunk count %q", raw)
+		}
+		return chunkMarker{count: n}, nil
+	}
+	parts := strings.Split(raw[3:], ":")
+	if len(parts) != 3 || len(parts[0]) != 32 || len(parts[2]) != 64 {
+		return chunkMarker{}, errors.New("keychain: invalid versioned marker")
+	}
+	if _, err := hex.DecodeString(parts[0]); err != nil {
+		return chunkMarker{}, fmt.Errorf("keychain: invalid generation: %w", err)
+	}
+	if _, err := hex.DecodeString(parts[2]); err != nil {
+		return chunkMarker{}, fmt.Errorf("keychain: invalid digest: %w", err)
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil || n < 1 {
+		return chunkMarker{}, errors.New("keychain: invalid versioned chunk count")
+	}
+	return chunkMarker{generation: parts[0], count: n, digest: parts[2]}, nil
+}
+
+func (k *keychainStore) marker(key string) (chunkMarker, bool, error) {
+	raw, err := keyring.Get(k.service, key)
 	if errors.Is(err, keyring.ErrNotFound) {
-		return nil, nil
+		return chunkMarker{}, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return chunkMarker{}, false, err
 	}
-	n, err := strconv.Atoi(countStr)
-	if err != nil {
-		return nil, fmt.Errorf("keychain: bad chunk count %q: %w", countStr, err)
+	m, err := parseMarker(raw)
+	return m, true, err
+}
+
+func (k *keychainStore) name(key string, m chunkMarker, i int) string {
+	if m.generation == "" {
+		return chunkName(key, i)
 	}
+	return key + "#" + m.generation + "#" + strconv.Itoa(i)
+}
+
+func (k *keychainStore) read(key string, m chunkMarker) ([]byte, error) {
 	var buf []byte
-	for i := range n {
-		c, err := keyring.Get(k.service, chunkName(key, i))
+	for i := range m.count {
+		c, err := keyring.Get(k.service, k.name(key, m, i))
 		if err != nil {
-			return nil, fmt.Errorf("keychain: read chunk %d/%d: %w", i, n, err)
+			return nil, fmt.Errorf("keychain: read chunk %d/%d: %w", i, m.count, err)
 		}
 		buf = append(buf, c...)
+	}
+	if m.generation != "" {
+		digest := sha256.Sum256(buf)
+		if hex.EncodeToString(digest[:]) != m.digest {
+			return nil, errors.New("keychain: chunk digest mismatch")
+		}
 	}
 	return buf, nil
 }
 
-// Save writes the blob as N chunks, then the count marker last as the commit
-// point, then sweeps any stale trailing chunks left by a previously larger blob.
-func (k *keychainStore) Save(_ context.Context, key string, blob []byte) error {
-	n := (len(blob) + keychainChunkSize - 1) / keychainChunkSize
-	if n == 0 {
-		n = 1 // always at least one (possibly empty) chunk
+func (k *keychainStore) removeChunks(key string, m chunkMarker) {
+	for i := range m.count {
+		_ = keyring.Delete(k.service, k.name(key, m, i))
 	}
+}
+
+// Load accepts legacy count markers and recovers the previous complete
+// generation when the current generation is damaged.
+func (k *keychainStore) Load(_ context.Context, key string) ([]byte, error) {
+	unlock, err := lockKeychain(k.service, key)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	m, found, err := k.marker(key)
+	if !found && err == nil {
+		return nil, nil
+	}
+	if err == nil {
+		if buf, readErr := k.read(key, m); readErr == nil {
+			return buf, nil
+		} else {
+			err = readErr
+		}
+	}
+	previous, found, prevErr := k.marker(key + "#previous")
+	if prevErr == nil && found {
+		if recovered, readErr := k.read(key, previous); readErr == nil {
+			return recovered, nil
+		}
+	}
+	return nil, err
+}
+
+// Save verifies a new immutable generation before publishing its marker.
+// A process crash or concurrent cooperating process cannot tear the active
+// generation. The last complete generation remains available for recovery.
+func (k *keychainStore) Save(_ context.Context, key string, blob []byte) error {
+	unlock, err := lockKeychain(k.service, key)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, found, err := k.marker(key)
+	// An invalid marker can still be repaired by a new Save. Preserve any
+	// existing backup rather than copying the invalid marker over it.
+	if err != nil {
+		found = false
+	}
+	previous, hadPrevious, err := k.marker(key + "#previous")
+	if err != nil {
+		return err
+	}
+	usableCurrent := false
+	if found {
+		_, readErr := k.read(key, current)
+		usableCurrent = readErr == nil
+	}
+	version := make([]byte, 16)
+	if _, err := rand.Read(version); err != nil {
+		return err
+	}
+	digest := sha256.Sum256(blob)
+	n := max(1, (len(blob)+keychainChunkSize-1)/keychainChunkSize)
+	next := chunkMarker{generation: hex.EncodeToString(version), count: n, digest: hex.EncodeToString(digest[:])}
 	for i := range n {
 		start := i * keychainChunkSize
 		end := min(start+keychainChunkSize, len(blob))
-		if err := keyring.Set(k.service, chunkName(key, i), string(blob[start:end])); err != nil {
+		if err := keyring.Set(k.service, k.name(key, next, i), string(blob[start:end])); err != nil {
 			return fmt.Errorf("keychain: write chunk %d: %w", i, err)
 		}
 	}
-	if err := keyring.Set(k.service, key, strconv.Itoa(n)); err != nil {
-		return fmt.Errorf("keychain: write count: %w", err)
+	if _, err := k.read(key, next); err != nil {
+		return fmt.Errorf("keychain: verify new generation: %w", err)
 	}
-	// Best-effort cleanup of chunks beyond n (blob shrank since last save).
-	for i := n; ; i++ {
-		name := chunkName(key, i)
-		if _, err := keyring.Get(k.service, name); errors.Is(err, keyring.ErrNotFound) {
-			break
+	if usableCurrent {
+		if err := keyring.Set(k.service, key+"#previous", current.encode()); err != nil {
+			return fmt.Errorf("keychain: write backup marker: %w", err)
 		}
-		_ = keyring.Delete(k.service, name)
+	}
+	if usableCurrent && current.generation == "" {
+		if err := keyring.Set(k.service, key+"#legacy-count", strconv.Itoa(current.count)); err != nil {
+			return fmt.Errorf("keychain: preserve legacy count: %w", err)
+		}
+	}
+	if err := keyring.Set(k.service, key, next.encode()); err != nil {
+		return fmt.Errorf("keychain: publish generation: %w", err)
+	}
+	// Never remove legacy chunks during migration. Remove only a superseded
+	// versioned generation after its replacement is published.
+	if hadPrevious && usableCurrent && previous.generation != "" && previous.generation != current.generation {
+		k.removeChunks(key, previous)
 	}
 	return nil
 }
 
-// Delete removes the count marker and all chunks (absent key is not an error).
+// Delete removes the current and previous published generations.
 func (k *keychainStore) Delete(_ context.Context, key string) error {
+	unlock, err := lockKeychain(k.service, key)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, found, err := k.marker(key)
+	if err != nil {
+		return err
+	}
+	previous, hadPrevious, err := k.marker(key + "#previous")
+	if err != nil {
+		return err
+	}
+	legacy, hadLegacy, err := k.marker(key + "#legacy-count")
+	if err != nil {
+		return err
+	}
 	if err := keyring.Delete(k.service, key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
 		return err
 	}
-	for i := 0; ; i++ {
-		name := chunkName(key, i)
-		if _, err := keyring.Get(k.service, name); errors.Is(err, keyring.ErrNotFound) {
-			break
-		}
-		_ = keyring.Delete(k.service, name)
+	if err := keyring.Delete(k.service, key+"#previous"); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return err
+	}
+	if err := keyring.Delete(k.service, key+"#legacy-count"); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return err
+	}
+	if found {
+		k.removeChunks(key, current)
+	}
+	if hadPrevious {
+		k.removeChunks(key, previous)
+	}
+	if hadLegacy {
+		k.removeChunks(key, legacy)
 	}
 	return nil
 }
