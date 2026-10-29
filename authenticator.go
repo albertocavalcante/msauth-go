@@ -18,9 +18,19 @@ import (
 // access). It does not coordinate across processes sharing one file cache.
 type Authenticator struct {
 	cfg    Config
-	client public.Client
+	client publicClient
 	store  cache.Store
 	key    string
+	bound  *AccountRef
+}
+
+// publicClient is the MSAL boundary; public values remain inside this package.
+type publicClient interface {
+	Accounts(context.Context) ([]public.Account, error)
+	RemoveAccount(context.Context, public.Account) error
+	AcquireTokenSilent(context.Context, []string, ...public.AcquireSilentOption) (public.AuthResult, error)
+	AcquireTokenByAuthCode(context.Context, string, string, []string, ...public.AcquireByAuthCodeOption) (public.AuthResult, error)
+	AcquireTokenByDeviceCode(context.Context, []string, ...public.AcquireByDeviceCodeOption) (public.DeviceCode, error)
 }
 
 // New builds an Authenticator for cfg, persisting the MSAL token cache in store.
@@ -78,12 +88,30 @@ func WithBrowserOpener(fn func(url string) error) LoginOption {
 // identity. The token cache is persisted as a side effect, so later Token calls
 // can refresh silently. The call is bounded by [Config.LoginTimeout].
 func (a *Authenticator) Login(ctx context.Context, opts ...LoginOption) (*Identity, error) {
+	res, err := a.login(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &Identity{
+		Username:      res.Account.PreferredUsername,
+		Name:          res.IDToken.Name,
+		HomeAccountID: res.Account.HomeAccountID,
+	}, nil
+}
+
+func (a *Authenticator) login(ctx context.Context, opts ...LoginOption) (public.AuthResult, error) {
+	if a.bound != nil {
+		// MSAL persists a login before returning its identity. A caller must
+		// stage reauthentication in a separate store, validate the result and
+		// only then publish that store; rejecting here cannot corrupt a grant.
+		return public.AuthResult{}, ErrBoundLogin
+	}
 	lc := loginConfig{scopes: a.cfg.Scopes}
 	for _, o := range opts {
 		o(&lc)
 	}
 	if len(lc.scopes) == 0 {
-		return nil, ErrNoScopes
+		return public.AuthResult{}, ErrNoScopes
 	}
 
 	var (
@@ -101,13 +129,9 @@ func (a *Authenticator) Login(ctx context.Context, opts ...LoginOption) (*Identi
 		res, err = a.loginInteractive(ictx, lc)
 	}
 	if err != nil {
-		return nil, err
+		return public.AuthResult{}, err
 	}
-	return &Identity{
-		Username:      res.Account.PreferredUsername,
-		Name:          res.IDToken.Name,
-		HomeAccountID: res.Account.HomeAccountID,
-	}, nil
+	return res, nil
 }
 
 // TokenOption customizes a Token call.
@@ -152,7 +176,11 @@ func (a *Authenticator) TokenInfo(ctx context.Context, opts ...TokenOption) (Acc
 	if err != nil {
 		return AccessToken{}, err
 	}
-	res, err := a.client.AcquireTokenSilent(ctx, tc.scopes, public.WithSilentAccount(acct))
+	silentOpts := []public.AcquireSilentOption{public.WithSilentAccount(acct)}
+	if a.bound != nil && a.bound.TenantID != personalTenantID {
+		silentOpts = append(silentOpts, public.WithTenantID(a.bound.TenantID))
+	}
+	res, err := a.client.AcquireTokenSilent(ctx, tc.scopes, silentOpts...)
 	if err != nil {
 		if isTransient(err) {
 			// Network/timeout/cancellation: a retry may succeed. Do NOT signal
@@ -163,6 +191,11 @@ func (a *Authenticator) TokenInfo(ctx context.Context, opts ...TokenOption) (Acc
 		// Otherwise the cached grant is unusable (expired/revoked/consent) →
 		// re-login is genuinely required; keep the cause inspectable.
 		return AccessToken{}, errors.Join(ErrLoginRequired, err)
+	}
+	if a.bound != nil {
+		if err := a.checkTokenAccount(res); err != nil {
+			return AccessToken{}, err
+		}
 	}
 	return AccessToken{
 		Value:         res.AccessToken,
@@ -192,10 +225,16 @@ func (a *Authenticator) Identity(ctx context.Context) (*Identity, error) {
 	return &Identity{Username: acct.PreferredUsername, HomeAccountID: acct.HomeAccountID}, nil
 }
 
-// Logout removes cached accounts. When [Config.Account] is set, only the
+// Logout returns ErrAccountRemovalUnsafe before IO on an exact-bound client.
+// For legacy New clients, Logout removes cached accounts. When [Config.Account] is set, only the
 // matching username or home_account_id is removed; otherwise all accounts under
 // this Authenticator's client id are removed.
 func (a *Authenticator) Logout(ctx context.Context) error {
+	// MSAL removal spans resource tenants and account enumeration omits
+	// token-only records. Exact-bound removal cannot establish ownership.
+	if a.bound != nil {
+		return ErrAccountRemovalUnsafe
+	}
 	accts, err := a.client.Accounts(ctx)
 	if err != nil {
 		if a.cfg.Account == "" {
@@ -226,6 +265,9 @@ func (a *Authenticator) account(ctx context.Context) (public.Account, error) {
 	}
 	if len(accts) == 0 {
 		return public.Account{}, ErrLoginRequired
+	}
+	if a.bound != nil {
+		return selectExactAccount(accts, *a.bound)
 	}
 	if a.cfg.Account != "" {
 		for i := range accts {

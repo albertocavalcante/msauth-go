@@ -73,8 +73,65 @@ if !token.HasScope("Mail.Send") { /* consent was declined */ }
 - `Login`: `WithDevice()`, `WithLoginScopes(...)`, `WithPrompt(fn)`, `WithBrowserOpener(fn)`.
 - `Token` / `TokenInfo`: `WithScopes(...)`.
 
+### Exact account connections
+
+`New` and `Config.Account` retain their existing selection behavior. Tools that
+manage independent connections can instead bind a client to an exact account:
+
+```go
+candidate, err := msauth.New(msauth.Config{
+    Authority: "https://login.microsoftonline.com/common",
+    Scopes: []string{"User.Read", "Mail.Read"},
+}, candidateStore) // a separate, private Store for this candidate
+if err != nil { return err }
+info, err := candidate.LoginAccount(ctx)
+if err != nil { return err }
+// Validate info.Ref against the expected identity when reauthenticating.
+bound, err := msauth.NewForAccount(msauth.Config{
+    Scopes: []string{"User.Read", "Mail.Read"},
+}, candidateStore, info.Ref)
+if err != nil { return err }
+_ = bound // publish this candidate only after identity validation succeeds
+```
+
+`AccountRef` includes the home-account ID, authority environment, resource tenant
+and optional local-account ID. IDs match exactly; environment hostnames match
+case-insensitively. A missing or ambiguous reference fails without using another
+cached identity. `NewForAccount` pins organizational token requests to that
+resource tenant and uses `/consumers` for Microsoft's documented [personal-account
+tenant](https://learn.microsoft.com/en-us/entra/msal/android/accounts-overview).
+Conflicting authority settings or `Config.Account` are rejected. The store layout
+and legacy default authority remain unchanged.
+
+`Accounts(ctx)` enumerates safe metadata without token acquisition or cache
+writes. `Account(ctx)` returns the selected metadata. `AccountInfo.CacheRealm`
+describes the cache entry's authority path: `common` and `organizations` do not
+prove a tenant, so enumerating them leaves `Ref.TenantID` empty. `LoginAccount`
+gets the resource tenant from the completed login result's ID-token claim;
+callers never need to parse a token or raw MSAL cache. A later exact selector can
+use a unique discovery entry with matching home and local IDs while explicitly
+requesting the verified tenant. An exact tenant entry takes precedence once it
+exists.
+
+A bound client refuses `Login` and `LoginAccount` with `ErrBoundLogin` before
+opening a browser or changing the cache. Stage reauthentication in a separate
+store, verify `LoginAccount`'s result and then publish it. Like legacy `Login`,
+`LoginAccount` persists the candidate before returning, including when identity
+metadata validation fails; the candidate's owner must discard it on failure.
+
+Bound `Logout` always returns `ErrAccountRemovalUnsafe` before IO. MSAL removes
+all resource realms for a home identity/environment pair, and account enumeration
+does not reveal every token-only record. Neither a matching discovery alias nor
+the number of listed accounts proves exclusive ownership of cached credentials.
+Give independently managed connections separate named keychain services or
+file-store directories. The owner of such an isolated namespace may explicitly
+clear it through an unbound authenticator; never apply that operation to a shared
+cache as a substitute for tenant-scoped removal. Legacy `New`/`Config.Account`
+logout behavior is unchanged. This library does not implement aliases, defaults,
+profile lifecycle or cross-process transaction locks.
+
 ## API
-`New`, `(*Authenticator).Login / Token / TokenInfo / TokenSource / Identity / Logout`. `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. `ErrLoginRequired` is joined into errors when no usable cached account exists. `ErrNoScopes` guards the empty-scope footgun on both `Login` and `Token`. `AccessToken` carries `Value`, `ExpiresOn`, `GrantedScopes`, plus `Expired(now, skew)` and `HasScope`. Test doubles in `msauthtest` (`MemStore`).
+`New`, `(*Authenticator).Login / Token / TokenInfo / TokenSource / Identity / Logout`. On legacy/unbound clients, `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. Exact-bound clients instead return `ErrAccountRemovalUnsafe` before IO. `ErrLoginRequired` is joined into errors when no usable cached account exists. `ErrNoScopes` guards the empty-scope footgun on both `Login` and `Token`. `AccessToken` carries `Value`, `ExpiresOn`, `GrantedScopes`, plus `Expired(now, skew)` and `HasScope`. Test doubles in `msauthtest` (`MemStore`).
 
 ## Develop
 ```sh
