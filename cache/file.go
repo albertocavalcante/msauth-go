@@ -48,21 +48,19 @@ func (f *fileStore) keyBytes() ([]byte, error) {
 	if _, err := rand.Read(nk); err != nil {
 		return nil, err
 	}
-	// Create atomically: O_EXCL means concurrent first-writers can't clobber
-	// each other's key (which would make blobs encrypted under the loser
-	// permanently undecryptable). On a lost race, adopt the winner's key.
-	fh, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return readKey(p)
-	}
+	// Publish only a fully written key. O_EXCL on the final path would expose
+	// an empty/partial key to another first writer before Write completes.
+	fh, err := os.CreateTemp(f.dir, ".cache-key-*.tmp")
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = fh.Close() }()
-	if _, err := fh.Write(nk); err != nil {
+	defer func() { _ = os.Remove(fh.Name()) }()
+	if err := writeSyncClose(fh, nk); err != nil {
 		return nil, err
 	}
-	if err := fh.Sync(); err != nil {
+	if err := os.Link(fh.Name(), p); errors.Is(err, os.ErrExist) {
+		return readKey(p)
+	} else if err != nil {
 		return nil, err
 	}
 	return nk, nil

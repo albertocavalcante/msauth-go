@@ -128,7 +128,32 @@ file-store directories. The owner of such an isolated namespace may explicitly
 clear it through an unbound authenticator; never apply that operation to a shared
 cache as a substitute for tenant-scoped removal. Legacy `New`/`Config.Account`
 logout behavior is unchanged. This library does not implement aliases, defaults,
-profile lifecycle or cross-process transaction locks.
+profile lifecycle.
+
+### Cache transactions
+
+Built-in keychain and encrypted-file stores implement `cache.TransactionalStore`.
+An authenticator holds a cancellable cross-process lock around each complete
+cache operation, including silent token refresh. It creates a fresh MSAL client
+inside the lock so deletion or replacement cannot leave stale in-memory accounts.
+Locks cover the entire keychain service or file-store directory: MSAL can retain
+multiple accounts and tenants in one cache blob. Process death releases the OS
+lock. Windows uses `LockFileEx`; Unix uses `flock`.
+
+`cache.Transact(ctx, store, callback)` exposes a temporary `Store` view. Use that
+view only within the callback; nesting through the original store can deadlock.
+Transactions serialize cooperating writers but do not roll back writes. Validate
+before publishing a single blob when atomic publication is required. Custom stores
+can implement the interface; otherwise the callback runs without coordination.
+
+Direct `Store` calls and older library versions do not acquire this transaction
+lock. Move a new application to its own namespace when older writers must remain
+available. Existing credentials may be a read-only migration seed; never let the
+old application write the new primary namespace. Interactive login also holds the
+lock, so applications needing concurrent silent refresh should stage login in a
+separate nontransactional store, verify the identity, then compare the original
+cache and publish the single staged blob inside a transaction. Account-bound
+login and logout remain rejected before any cache or lock IO.
 
 ## API
 `New`, `(*Authenticator).Login / Token / TokenInfo / TokenSource / Identity / Logout`. On legacy/unbound clients, `Logout` removes only `Config.Account` when set; otherwise it removes all cached accounts for the client ID. Exact-bound clients instead return `ErrAccountRemovalUnsafe` before IO. `ErrLoginRequired` is joined into errors when no usable cached account exists. `ErrNoScopes` guards the empty-scope footgun on both `Login` and `Token`. `AccessToken` carries `Value`, `ExpiresOn`, `GrantedScopes`, plus `Expired(now, skew)` and `HasScope`. Test doubles in `msauthtest` (`MemStore`).

@@ -76,6 +76,10 @@ func NewForAccount(cfg Config, store cache.Store, ref AccountRef) (*Authenticato
 // the cache. The result is sorted by reference for deterministic discovery.
 // It lists all accounts in this Store/client ID, including on a bound instance.
 func (a *Authenticator) Accounts(ctx context.Context) ([]AccountInfo, error) {
+	return withCacheValue(ctx, a, func(current *Authenticator) ([]AccountInfo, error) { return current.accounts(ctx) })
+}
+
+func (a *Authenticator) accounts(ctx context.Context) ([]AccountInfo, error) {
 	accounts, err := a.client.Accounts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("msauth: list accounts: %w", err)
@@ -92,6 +96,10 @@ func (a *Authenticator) Accounts(ctx context.Context) ([]AccountInfo, error) {
 // a token. On a bound instance Ref is the exact configured reference; CacheRealm
 // still describes the underlying cache entry.
 func (a *Authenticator) Account(ctx context.Context) (*AccountInfo, error) {
+	return withCacheValue(ctx, a, func(current *Authenticator) (*AccountInfo, error) { return current.accountInfo(ctx) })
+}
+
+func (a *Authenticator) accountInfo(ctx context.Context) (*AccountInfo, error) {
 	account, err := a.account(ctx)
 	if err != nil {
 		return nil, err
