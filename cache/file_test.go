@@ -12,11 +12,13 @@ import (
 
 func TestEmptyFileStoreRejectsOperationsWithoutTouchingWorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir)
 	valid := NewFileStore(dir)
 	if err := valid.Save(t.Context(), "victim", []byte("synthetic")); err != nil {
 		t.Fatal(err)
 	}
+	// Windows keeps a handle on its working directory; seed the fixture before
+	// selecting it so ACL setup is independent of the empty-root rejection.
+	t.Chdir(dir)
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
