@@ -3,10 +3,87 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestEmptyFileStoreRejectsOperationsWithoutTouchingWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	valid := NewFileStore(dir)
+	if err := valid.Save(t.Context(), "victim", []byte("synthetic")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string][]byte{}
+	permissions := map[string]string{dir: permissionSnapshot(t, dir)}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[entry.Name()] = data
+		permissions[path] = permissionSnapshot(t, path)
+	}
+	empty := NewFileStore("")
+	for _, key := range []string{"missing", "victim"} {
+		if _, err := empty.Load(t.Context(), key); err == nil {
+			t.Errorf("empty-root Load(%s) succeeded", key)
+		}
+	}
+	if err := empty.Save(t.Context(), "new", []byte("candidate")); err == nil {
+		t.Error("empty-root Save succeeded")
+	}
+	if err := empty.Delete(t.Context(), "victim"); err == nil {
+		t.Error("empty-root Delete succeeded")
+	}
+	called := false
+	tx := empty.(TransactionalStore)
+	if err := tx.Transact(t.Context(), func(Store) error { called = true; return nil }); err == nil || called {
+		t.Error("empty-root transaction succeeded or invoked callback")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := tx.Transact(ctx, func(Store) error { called = true; return nil }); !errors.Is(err, context.Canceled) || called {
+		t.Error("cancellation did not precede path checks")
+	}
+	if err := tx.Transact(t.Context(), nil); err == nil || !strings.Contains(err.Error(), "nil transaction callback") {
+		t.Error("nil callback did not precede path checks")
+	}
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(entries) {
+		t.Errorf("working-directory entries changed: %d -> %d", len(entries), len(after))
+	}
+	for _, entry := range after {
+		want, ok := contents[entry.Name()]
+		if !ok {
+			t.Errorf("unexpected working-directory file %s", entry.Name())
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("working-directory file %s changed", entry.Name())
+		}
+	}
+	for path, want := range permissions {
+		if got := permissionSnapshot(t, path); got != want {
+			t.Errorf("working-directory permissions changed for %s", path)
+		}
+	}
+}
 
 func TestFileStore_RoundTripAndPersistence(t *testing.T) {
 	dir := t.TempDir()

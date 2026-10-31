@@ -12,6 +12,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func permissionSnapshot(t *testing.T, path string) string {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sd.String()
+}
+
 func assertPrivateCachePermissions(t *testing.T, dir, key, blob string) {
 	t.Helper()
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()

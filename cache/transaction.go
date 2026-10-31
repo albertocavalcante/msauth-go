@@ -205,6 +205,9 @@ func (f *fileStore) Transact(ctx context.Context, fn func(Store) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := f.validateDir(); err != nil {
+		return err
+	}
 	if err := validateKeyFile(filepath.Join(f.dir, keyFileName)); err != nil && !os.IsNotExist(err) {
 		return err
 	}

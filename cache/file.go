@@ -29,11 +29,19 @@ type fileStore struct {
 // NewFileStore returns an encrypted-file [Store] rooted at dir. The directory
 // is made private on first use: mode 0700 on Unix, or a current-user-only
 // protected DACL on Windows. New cache files are private to that user too.
+// Operations reject an empty dir; use "." explicitly to select the working directory.
 func NewFileStore(dir string) Store {
 	return &fileStore{dir: dir}
 }
 
 const keyFileName = "cache.key"
+
+func (f *fileStore) validateDir() error {
+	if f.dir == "" {
+		return errors.New("cache: empty file-store directory")
+	}
+	return nil
+}
 
 func (f *fileStore) keyBytes() ([]byte, error) {
 	p := filepath.Join(f.dir, keyFileName)
@@ -122,6 +130,9 @@ func (f *fileStore) path(key string) string {
 }
 
 func (f *fileStore) Load(_ context.Context, key string) ([]byte, error) {
+	if err := f.validateDir(); err != nil {
+		return nil, err
+	}
 	ct, err := os.ReadFile(f.path(key))
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -145,6 +156,9 @@ func (f *fileStore) Load(_ context.Context, key string) ([]byte, error) {
 }
 
 func (f *fileStore) Save(_ context.Context, key string, blob []byte) error {
+	if err := f.validateDir(); err != nil {
+		return err
+	}
 	gcm, err := f.gcm()
 	if err != nil {
 		return err
@@ -205,6 +219,9 @@ func writeSyncClose(f *os.File, data []byte) error {
 }
 
 func (f *fileStore) Delete(_ context.Context, key string) error {
+	if err := f.validateDir(); err != nil {
+		return err
+	}
 	err := os.Remove(f.path(key))
 	if os.IsNotExist(err) {
 		return nil
