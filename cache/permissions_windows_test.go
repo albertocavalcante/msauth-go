@@ -125,33 +125,51 @@ func TestFileStoreRepairsExistingWindowsKeyACL(t *testing.T) {
 }
 
 func TestNonregularWindowsKeyRetainsItsACL(t *testing.T) {
-	dir := t.TempDir()
-	key := filepath.Join(dir, keyFileName)
-	if err := os.Mkdir(key, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	child := filepath.Join(key, "unrelated")
-	if err := os.WriteFile(child, []byte("synthetic"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before := map[string]string{}
-	for _, path := range []string{key, child} {
-		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-		if err != nil {
-			t.Fatal(err)
+	for _, coordinated := range []bool{false, true} {
+		name := "direct-save"
+		if coordinated {
+			name = "transaction"
 		}
-		before[path] = sd.String()
-	}
-	if err := NewFileStore(dir).Save(t.Context(), "cache", []byte("synthetic")); err == nil {
-		t.Fatal("accepted a directory as an encryption key")
-	}
-	for path, want := range before {
-		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sd.String() != want {
-			t.Fatalf("invalid key path ACL changed: %s -> %s", want, sd.String())
-		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			key := filepath.Join(dir, keyFileName)
+			if err := os.Mkdir(key, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			child := filepath.Join(key, "unrelated")
+			if err := os.WriteFile(child, []byte("synthetic"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before := map[string]string{}
+			for _, path := range []string{dir, key, child} {
+				sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = sd.String()
+			}
+			store := NewFileStore(dir)
+			var err error
+			if coordinated {
+				err = Transact(t.Context(), store, func(Store) error {
+					t.Fatal("invalid key reached transaction callback")
+					return nil
+				})
+			} else {
+				err = store.Save(t.Context(), "cache", []byte("synthetic"))
+			}
+			if err == nil {
+				t.Fatal("accepted a directory as an encryption key")
+			}
+			for path, want := range before {
+				sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sd.String() != want {
+					t.Fatalf("invalid key path ACL changed: %s -> %s", want, sd.String())
+				}
+			}
+		})
 	}
 }

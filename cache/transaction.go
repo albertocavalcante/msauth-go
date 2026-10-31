@@ -199,5 +199,14 @@ func (k *keychainStore) Transact(ctx context.Context, fn func(Store) error) erro
 
 // Transact coordinates all cache keys in this encrypted-file directory.
 func (f *fileStore) Transact(ctx context.Context, fn func(Store) error) error {
+	if fn == nil {
+		return errors.New("cache: nil transaction callback")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateKeyFile(filepath.Join(f.dir, keyFileName)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return runTransaction(ctx, f, filepath.Join(f.dir, ".msauth-transaction.lock"), fn)
 }

@@ -86,6 +86,45 @@ func TestFileStoreRejectsNonregularKeyWithoutChangingIt(t *testing.T) {
 	}
 }
 
+func TestFileTransactionRejectsInvalidKeyBeforeChangingPermissions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, keyFileName)
+	if err := os.Mkdir(key, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(key, "unrelated")
+	if err := os.WriteFile(child, []byte("synthetic"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]os.FileMode{}
+	for _, path := range []string{dir, key, child} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = info.Mode()
+	}
+	err := Transact(t.Context(), NewFileStore(dir), func(Store) error {
+		t.Fatal("invalid key reached transaction callback")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("accepted a directory as an encryption key")
+	}
+	for path, want := range before {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode() != want {
+			t.Fatalf("rejected transaction changed %s permissions: %v -> %v", path, want, info.Mode())
+		}
+	}
+}
+
 func TestFileStore_AbsentAndDelete(t *testing.T) {
 	ctx := context.Background()
 	st := NewFileStore(t.TempDir())
