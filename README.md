@@ -169,6 +169,16 @@ login and logout remain rejected before any cache or lock IO.
 ```sh
 just ci   # fmt-check + vet + test-race + lint
 ```
+The public `tools.go.mod` pins only test and lint tools. Optional `just mutate`
+commands use `tools/mutation/go.mod` and require authorized access to the private
+mutation tool. Normal CI and consumer installs do not fetch that module or need
+cross-repository credentials.
+
+The alternate public tools file uses the library's module path so `just
+tidy-tools` resolves this checkout's packages rather than downloading an older
+copy of the library. Use `just tidy-mutation-tools` explicitly to maintain the
+optional private tool module.
+
 Deps: MSAL Go, `zalando/go-keyring`, `pkg/browser`. cgo-free. `go 1.26`.
 
 Manual live smoke test:
