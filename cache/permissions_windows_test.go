@@ -106,3 +106,35 @@ func TestFileStoreRepairsExistingWindowsKeyACL(t *testing.T) {
 	}
 	assertPrivateCachePermissions(t, dir, key, store.(*fileStore).path("cache"))
 }
+
+func TestNonregularWindowsKeyRetainsItsACL(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, keyFileName)
+	if err := os.Mkdir(key, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(key, "unrelated")
+	if err := os.WriteFile(child, []byte("synthetic"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]string{}
+	for _, path := range []string{key, child} {
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = sd.String()
+	}
+	if err := NewFileStore(dir).Save(t.Context(), "cache", []byte("synthetic")); err == nil {
+		t.Fatal("accepted a directory as an encryption key")
+	}
+	for path, want := range before {
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sd.String() != want {
+			t.Fatalf("invalid key path ACL changed: %s -> %s", want, sd.String())
+		}
+	}
+}
