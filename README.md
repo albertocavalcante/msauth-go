@@ -140,6 +140,11 @@ Locks cover the entire keychain service or file-store directory: MSAL can retain
 multiple accounts and tenants in one cache blob. Process death releases the OS
 lock. Windows uses `LockFileEx`; Unix uses `flock`.
 
+Encrypted-file storage uses Unix permission modes or protected Windows DACLs
+that grant only the current process user access. Existing encryption keys are
+protected before use, and new key/ciphertext files are protected before writing.
+Directory protection does not recursively rewrite existing children's ACLs.
+
 `cache.Transact(ctx, store, callback)` exposes a temporary `Store` view. Use that
 view only within the callback; nesting through the original store can deadlock.
 Transactions serialize cooperating writers but do not roll back writes. Validate

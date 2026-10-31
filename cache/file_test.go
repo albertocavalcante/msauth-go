@@ -57,30 +57,32 @@ func TestFileStore_TightensExistingDirectoryPermissions(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat dir: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("dir mode = %o, want 700", got)
-	}
-	keyInfo, err := os.Stat(filepath.Join(dir, keyFileName))
-	if err != nil {
-		t.Fatalf("stat key: %v", err)
-	}
-	if got := keyInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("key mode = %o, want 600", got)
-	}
 	files, _ := filepath.Glob(filepath.Join(dir, "*.enc"))
 	if len(files) != 1 {
 		t.Fatalf("want 1 .enc file, got %d", len(files))
 	}
-	blobInfo, err := os.Stat(files[0])
-	if err != nil {
-		t.Fatalf("stat blob: %v", err)
+	assertPrivateCachePermissions(t, dir, filepath.Join(dir, keyFileName), files[0])
+}
+
+func TestFileStoreRejectsNonregularKeyWithoutChangingIt(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, keyFileName)
+	if err := os.Mkdir(key, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if got := blobInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("blob mode = %o, want 600", got)
+	before, err := os.Stat(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewFileStore(dir).Save(t.Context(), "cache", []byte("synthetic")); err == nil {
+		t.Fatal("accepted a directory as an encryption key")
+	}
+	after, err := os.Stat(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode() != before.Mode() {
+		t.Fatalf("invalid key was modified: %v -> %v", before.Mode(), after.Mode())
 	}
 }
 

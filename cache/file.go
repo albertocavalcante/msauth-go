@@ -27,7 +27,8 @@ type fileStore struct {
 }
 
 // NewFileStore returns an encrypted-file [Store] rooted at dir. The directory
-// is created (0700) on first write.
+// is made private on first use: mode 0700 on Unix, or a current-user-only
+// protected DACL on Windows. New cache files are private to that user too.
 func NewFileStore(dir string) Store {
 	return &fileStore{dir: dir}
 }
@@ -55,6 +56,10 @@ func (f *fileStore) keyBytes() ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = os.Remove(fh.Name()) }()
+	if err := setPrivateFilePermissions(fh.Name()); err != nil {
+		_ = fh.Close()
+		return nil, err
+	}
 	if err := writeSyncClose(fh, nk); err != nil {
 		return nil, err
 	}
@@ -67,15 +72,22 @@ func (f *fileStore) keyBytes() ([]byte, error) {
 }
 
 func readKey(p string) ([]byte, error) {
+	info, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("cache: encryption key must be a regular file")
+	}
+	if err := setPrivateFilePermissions(p); err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(p)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) != 32 {
 		return nil, fmt.Errorf("cache key %s is corrupt (want 32 bytes, got %d)", p, len(b))
-	}
-	if err := os.Chmod(p, 0o600); err != nil {
-		return nil, err
 	}
 	return b, nil
 }
@@ -145,6 +157,11 @@ func (f *fileStore) Save(_ context.Context, key string, blob []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	if err := setPrivateFilePermissions(tmpName); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
 	if err := writeSyncClose(tmp, ct); err != nil {
 		_ = os.Remove(tmpName)
 		return err
@@ -160,7 +177,7 @@ func ensurePrivateDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.Chmod(dir, 0o700)
+	return setPrivateDirPermissions(dir)
 }
 
 func writeSyncClose(f *os.File, data []byte) error {
