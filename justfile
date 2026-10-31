@@ -48,6 +48,10 @@ tidy:
 tidy-tools:
     go mod tidy -modfile=tools.go.mod
 
+# Optional private tool maintenance; never part of the public CI gate.
+tidy-mutation-tools:
+    cd tools/mutation && go mod tidy
+
 # Update goldens
 update-goldens:
     MSAUTH_UPDATE_GOLDENS=1 go test ./...
@@ -63,9 +67,9 @@ clean:
 # seeing whether a test notices. A surviving mutant names something no test
 # checks. This is deliberately not part of `ci`: it takes minutes, not seconds.
 mutate *ARGS:
-    go tool -modfile=tools.go.mod mutante run {{ARGS}}
+    go tool -modfile=tools/mutation/go.mod mutante run {{ARGS}}
 
 # Boundary comparisons only, which is the fastest useful slice and where
 # off-by-one bugs hide.
 mutate-bounds:
-    go tool -modfile=tools.go.mod mutante run --operators cond_boundary
+    go tool -modfile=tools/mutation/go.mod mutante run --operators cond_boundary

@@ -13,15 +13,18 @@ import (
 )
 
 // Authenticator signs a user in and hands out delegated access tokens, backed
-// by a persistent token cache for silent refresh. It is safe for concurrent
-// use by multiple goroutines within a single process (MSAL serializes cache
-// access). It does not coordinate across processes sharing one file cache.
+// by a persistent token cache for silent refresh. Built-in stores coordinate complete
+// operations across cooperating processes. Custom stores must implement
+// cache.TransactionalStore for coordination across Authenticator instances.
+// Older clients and direct Store writes are not coordinated; isolate their
+// storage when they must coexist.
 type Authenticator struct {
-	cfg    Config
-	client publicClient
-	store  cache.Store
-	key    string
-	bound  *AccountRef
+	cfg       Config
+	client    publicClient
+	store     cache.Store
+	key       string
+	bound     *AccountRef
+	newClient func(cache.Store) (publicClient, error)
 }
 
 // publicClient is the MSAL boundary; public values remain inside this package.
@@ -41,15 +44,18 @@ func New(cfg Config, store cache.Store) (*Authenticator, error) {
 	}
 	cfg = cfg.withDefaults()
 	key := cfg.cacheKey()
-	client, err := public.New(
-		cfg.ClientID,
-		public.WithAuthority(cfg.Authority),
-		public.WithCache(cache.NewMSALAccessor(store, key)),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("msauth: new client: %w", err)
+	factory := func(current cache.Store) (publicClient, error) {
+		client, err := public.New(cfg.ClientID, public.WithAuthority(cfg.Authority), public.WithCache(cache.NewMSALAccessor(current, key)))
+		if err != nil {
+			return nil, fmt.Errorf("msauth: new client: %w", err)
+		}
+		return client, nil
 	}
-	return &Authenticator{cfg: cfg, client: client, store: store, key: key}, nil
+	client, err := factory(store)
+	if err != nil {
+		return nil, err
+	}
+	return &Authenticator{cfg: cfg, client: client, store: store, key: key, newClient: factory}, nil
 }
 
 // LoginOption customizes a Login call.
@@ -114,24 +120,12 @@ func (a *Authenticator) login(ctx context.Context, opts ...LoginOption) (public.
 		return public.AuthResult{}, ErrNoScopes
 	}
 
-	var (
-		res public.AuthResult
-		err error
-	)
 	if lc.device {
-		// Device-code is bounded by the code's own expiry (~15m), which MSAL
-		// honors from the caller ctx. Do NOT impose the short interactive
-		// LoginTimeout — the user must switch devices to enter the code.
-		res, err = a.loginDevice(ctx, lc)
-	} else {
-		ictx, cancel := context.WithTimeout(ctx, a.cfg.LoginTimeout)
-		defer cancel()
-		res, err = a.loginInteractive(ictx, lc)
+		return withCacheValue(ctx, a, func(current *Authenticator) (public.AuthResult, error) { return current.loginDevice(ctx, lc) })
 	}
-	if err != nil {
-		return public.AuthResult{}, err
-	}
-	return res, nil
+	ictx, cancel := context.WithTimeout(ctx, a.cfg.LoginTimeout)
+	defer cancel()
+	return withCacheValue(ictx, a, func(current *Authenticator) (public.AuthResult, error) { return current.loginInteractive(ictx, lc) })
 }
 
 // TokenOption customizes a Token call.
@@ -172,6 +166,10 @@ func (a *Authenticator) TokenInfo(ctx context.Context, opts ...TokenOption) (Acc
 		// would otherwise be misreported as ErrLoginRequired.
 		return AccessToken{}, ErrNoScopes
 	}
+	return withCacheValue(ctx, a, func(current *Authenticator) (AccessToken, error) { return current.tokenInfo(ctx, tc) })
+}
+
+func (a *Authenticator) tokenInfo(ctx context.Context, tc tokenConfig) (AccessToken, error) {
 	acct, err := a.account(ctx)
 	if err != nil {
 		return AccessToken{}, err
@@ -218,6 +216,10 @@ func isTransient(err error) bool {
 // empty here (it comes from the login-time id token). Returns
 // [ErrLoginRequired] when nothing is cached.
 func (a *Authenticator) Identity(ctx context.Context) (*Identity, error) {
+	return withCacheValue(ctx, a, func(current *Authenticator) (*Identity, error) { return current.identity(ctx) })
+}
+
+func (a *Authenticator) identity(ctx context.Context) (*Identity, error) {
 	acct, err := a.account(ctx)
 	if err != nil {
 		return nil, err
@@ -235,6 +237,11 @@ func (a *Authenticator) Logout(ctx context.Context) error {
 	if a.bound != nil {
 		return ErrAccountRemovalUnsafe
 	}
+	_, err := withCacheValue(ctx, a, func(current *Authenticator) (struct{}, error) { return struct{}{}, current.logout(ctx) })
+	return err
+}
+
+func (a *Authenticator) logout(ctx context.Context) error {
 	accts, err := a.client.Accounts(ctx)
 	if err != nil {
 		if a.cfg.Account == "" {
@@ -309,4 +316,28 @@ func accountMatches(acct public.Account, value string) bool {
 		}
 	}
 	return false
+}
+
+// A new MSAL client per coordinated operation prevents deleted or replaced
+// persistent state from surviving in an older client's in-memory cache.
+func withCacheValue[T any](ctx context.Context, a *Authenticator, fn func(*Authenticator) (T, error)) (T, error) {
+	if _, ok := a.store.(cache.TransactionalStore); !ok {
+		return fn(a)
+	}
+	var value T
+	err := cache.Transact(ctx, a.store, func(store cache.Store) error {
+		current := *a
+		current.store = store
+		if a.newClient != nil {
+			client, err := a.newClient(store)
+			if err != nil {
+				return err
+			}
+			current.client = client
+		}
+		var err error
+		value, err = fn(&current)
+		return err
+	})
+	return value, err
 }

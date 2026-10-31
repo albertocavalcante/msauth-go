@@ -3,10 +3,89 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestEmptyFileStoreRejectsOperationsWithoutTouchingWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	valid := NewFileStore(dir)
+	if err := valid.Save(t.Context(), "victim", []byte("synthetic")); err != nil {
+		t.Fatal(err)
+	}
+	// Windows keeps a handle on its working directory; seed the fixture before
+	// selecting it so ACL setup is independent of the empty-root rejection.
+	t.Chdir(dir)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string][]byte{}
+	permissions := map[string]string{dir: permissionSnapshot(t, dir)}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[entry.Name()] = data
+		permissions[path] = permissionSnapshot(t, path)
+	}
+	empty := NewFileStore("")
+	for _, key := range []string{"missing", "victim"} {
+		if _, err := empty.Load(t.Context(), key); err == nil {
+			t.Errorf("empty-root Load(%s) succeeded", key)
+		}
+	}
+	if err := empty.Save(t.Context(), "new", []byte("candidate")); err == nil {
+		t.Error("empty-root Save succeeded")
+	}
+	if err := empty.Delete(t.Context(), "victim"); err == nil {
+		t.Error("empty-root Delete succeeded")
+	}
+	called := false
+	tx := empty.(TransactionalStore)
+	if err := tx.Transact(t.Context(), func(Store) error { called = true; return nil }); err == nil || called {
+		t.Error("empty-root transaction succeeded or invoked callback")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := tx.Transact(ctx, func(Store) error { called = true; return nil }); !errors.Is(err, context.Canceled) || called {
+		t.Error("cancellation did not precede path checks")
+	}
+	if err := tx.Transact(t.Context(), nil); err == nil || !strings.Contains(err.Error(), "nil transaction callback") {
+		t.Error("nil callback did not precede path checks")
+	}
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(entries) {
+		t.Errorf("working-directory entries changed: %d -> %d", len(entries), len(after))
+	}
+	for _, entry := range after {
+		want, ok := contents[entry.Name()]
+		if !ok {
+			t.Errorf("unexpected working-directory file %s", entry.Name())
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("working-directory file %s changed", entry.Name())
+		}
+	}
+	for path, want := range permissions {
+		if got := permissionSnapshot(t, path); got != want {
+			t.Errorf("working-directory permissions changed for %s", path)
+		}
+	}
+}
 
 func TestFileStore_RoundTripAndPersistence(t *testing.T) {
 	dir := t.TempDir()
@@ -57,30 +136,71 @@ func TestFileStore_TightensExistingDirectoryPermissions(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat dir: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("dir mode = %o, want 700", got)
-	}
-	keyInfo, err := os.Stat(filepath.Join(dir, keyFileName))
-	if err != nil {
-		t.Fatalf("stat key: %v", err)
-	}
-	if got := keyInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("key mode = %o, want 600", got)
-	}
 	files, _ := filepath.Glob(filepath.Join(dir, "*.enc"))
 	if len(files) != 1 {
 		t.Fatalf("want 1 .enc file, got %d", len(files))
 	}
-	blobInfo, err := os.Stat(files[0])
-	if err != nil {
-		t.Fatalf("stat blob: %v", err)
+	assertPrivateCachePermissions(t, dir, filepath.Join(dir, keyFileName), files[0])
+}
+
+func TestFileStoreRejectsNonregularKeyWithoutChangingIt(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, keyFileName)
+	if err := os.Mkdir(key, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if got := blobInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("blob mode = %o, want 600", got)
+	before, err := os.Stat(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewFileStore(dir).Save(t.Context(), "cache", []byte("synthetic")); err == nil {
+		t.Fatal("accepted a directory as an encryption key")
+	}
+	after, err := os.Stat(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode() != before.Mode() {
+		t.Fatalf("invalid key was modified: %v -> %v", before.Mode(), after.Mode())
+	}
+}
+
+func TestFileTransactionRejectsInvalidKeyBeforeChangingPermissions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, keyFileName)
+	if err := os.Mkdir(key, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(key, "unrelated")
+	if err := os.WriteFile(child, []byte("synthetic"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]os.FileMode{}
+	for _, path := range []string{dir, key, child} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = info.Mode()
+	}
+	err := Transact(t.Context(), NewFileStore(dir), func(Store) error {
+		t.Fatal("invalid key reached transaction callback")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("accepted a directory as an encryption key")
+	}
+	for path, want := range before {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode() != want {
+			t.Fatalf("rejected transaction changed %s permissions: %v -> %v", path, want, info.Mode())
+		}
 	}
 }
 
