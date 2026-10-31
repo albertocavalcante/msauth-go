@@ -33,7 +33,8 @@ func setPrivateDirPermissions(path string) error {
 		return err
 	}
 	// MAXIMUM_ALLOWED is intentional: SetSecurityInfo then changes only this
-	// directory, without propagating ACL changes into existing children.
+	// directory without propagating new grants into existing children. Windows
+	// may normalize inherited flags while retaining those children's grants.
 	// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo
 	h, err := windows.CreateFile(name, windows.MAXIMUM_ALLOWED,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,

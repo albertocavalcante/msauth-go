@@ -36,10 +36,15 @@ func NewFileStore(dir string) Store {
 const keyFileName = "cache.key"
 
 func (f *fileStore) keyBytes() ([]byte, error) {
+	p := filepath.Join(f.dir, keyFileName)
+	// Reject invalid existing key paths before changing directory permissions.
+	// On Windows, a parent DACL update may normalize inherited child ACE flags.
+	if err := validateKeyFile(p); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
 	if err := ensurePrivateDir(f.dir); err != nil {
 		return nil, err
 	}
-	p := filepath.Join(f.dir, keyFileName)
 	if b, err := readKey(p); err == nil {
 		return b, nil // fast path: key already exists
 	} else if !os.IsNotExist(err) {
@@ -71,13 +76,20 @@ func (f *fileStore) keyBytes() ([]byte, error) {
 	return nk, nil
 }
 
-func readKey(p string) ([]byte, error) {
+func validateKeyFile(p string) error {
 	info, err := os.Lstat(p)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("cache: encryption key must be a regular file")
+		return errors.New("cache: encryption key must be a regular file")
+	}
+	return nil
+}
+
+func readKey(p string) ([]byte, error) {
+	if err := validateKeyFile(p); err != nil {
+		return nil, err
 	}
 	if err := setPrivateFilePermissions(p); err != nil {
 		return nil, err

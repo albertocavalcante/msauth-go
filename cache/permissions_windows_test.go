@@ -52,7 +52,7 @@ func assertPrivateCachePermissions(t *testing.T, dir, key, blob string) {
 	}
 }
 
-func TestPrivateDirectoryDoesNotRewriteExistingChildACL(t *testing.T) {
+func TestPrivateDirectoryPreservesExistingChildGrants(t *testing.T) {
 	dir := t.TempDir()
 	child := filepath.Join(dir, "unrelated")
 	if err := os.WriteFile(child, []byte("synthetic"), 0o600); err != nil {
@@ -69,9 +69,26 @@ func TestPrivateDirectoryDoesNotRewriteExistingChildACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before.String() != after.String() {
-		t.Fatalf("directory protection changed child ACL: %s -> %s", before.String(), after.String())
+	// Windows preserves access but can turn old inherited ACEs into explicit
+	// ACEs when the parent no longer grants them. Compare every grant field,
+	// allowing only that INHERITED_ACE metadata normalization.
+	if withoutInheritedACEFlag(t, before.String()) != withoutInheritedACEFlag(t, after.String()) {
+		t.Fatalf("directory protection changed child grants: %s -> %s", before.String(), after.String())
 	}
+}
+
+func withoutInheritedACEFlag(t *testing.T, sddl string) string {
+	t.Helper()
+	parts := strings.Split(sddl, "(")
+	for i := 1; i < len(parts); i++ {
+		fields := strings.Split(parts[i], ";")
+		if len(fields) != 6 {
+			t.Fatalf("unexpected ACE format: %s", parts[i])
+		}
+		fields[1] = strings.ReplaceAll(fields[1], "ID", "")
+		parts[i] = strings.Join(fields, ";")
+	}
+	return strings.Join(parts, "(")
 }
 
 func TestFileStoreRepairsExistingWindowsKeyACL(t *testing.T) {

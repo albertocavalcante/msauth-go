@@ -143,7 +143,9 @@ lock. Windows uses `LockFileEx`; Unix uses `flock`.
 Encrypted-file storage uses Unix permission modes or protected Windows DACLs
 that grant only the current process user access. Existing encryption keys are
 protected before use, and new key/ciphertext files are protected before writing.
-Directory protection does not recursively rewrite existing children's ACLs.
+Directory protection preserves existing children's access grants; Windows may
+normalize their inheritance flags. Invalid key paths are rejected before any
+directory permission change.
 
 `cache.Transact(ctx, store, callback)` exposes a temporary `Store` view. Use that
 view only within the callback; nesting through the original store can deadlock.
